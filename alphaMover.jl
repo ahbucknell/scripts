@@ -14,21 +14,28 @@ end
 function findBestPkl(path)
     pklContents = JSON.parsefile(joinpath(path, "ranking_debug.json"))
     topPikl = pklContents["order"][1]
-    return topPikl * ".pkl"
+    return "result_" * topPikl * ".pkl"
+end
+
+function mvTargetFiles(subdir)
 end
 
 function main()
     args = parseArgs()
     targetDir = joinpath(@__DIR__, args["arg1"])
-    dirContents = readdir(targetDir)
-    notHidden = filter(f -> !startswith(basename(f), "."), dirContents)
+    subDirs = readdir(targetDir)
+    notHidden = filter(f -> !startswith(f, "."), subDirs)
     for subDir in joinpath.(targetDir, notHidden)
-        targetPikl = findBestPkl(subDir)
         fileName = split(subDir, "/")[end]
-        for file in [["ranked_0.pdb", ".pdb"], [targetPikl, ".pkl"]]
-            old = joinpath(subDir, file[1])
-            new = joinpath(dirname(subDir), fileName * file[2])
-            mv(old, new)
+        try
+            targetPikl = findBestPkl(subDir)
+            for file in [["ranked_0.pdb", ".pdb"], [targetPikl, ".pkl"]]
+                old = joinpath(subDir, file[1])
+                new = joinpath(dirname(subDir), fileName * file[2])
+                mv(old, new)
+            end
+        catch
+            println("Missing at least one necessary file. Skipping: ", fileName)
         end
     end
 end
