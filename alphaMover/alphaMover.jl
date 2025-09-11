@@ -17,7 +17,8 @@ end
 
 function main()
     args = parseArgs()
-    targetDir = joinpath(@__DIR__, args["arg1"])
+    targetDir = abspath(args["arg1"])
+    #targetDir = joinpath(@__DIR__, args["arg1"])
     subDirs = readdir(targetDir)
     notHidden = filter(f -> !startswith(f, "."), subDirs)
     for subDir in joinpath.(targetDir, notHidden)
