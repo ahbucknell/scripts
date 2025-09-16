@@ -51,6 +51,7 @@ function convertFile(fPath)
     outData = Dict(k => translateTypes(pklData[k]) for k in targetKeys)
     filename = split(basename(fPath), ".")[1]*".json"
     oPath = joinpath(dirname(fPath), filename)
+    println(filename)
     open("$oPath", "w") do io
         JSON3.write(io, outData)
     end
