@@ -1,8 +1,8 @@
 #!/bin/bash
 # Verify a CRISPR + cassette knock-in strain from paired-end WGS.
 #
-# Maps R1/R2 as a PAIR to a chimeric reference (genome + cassette contig) built
-# by ko_prepare_ref.sh, then reports three independent lines of evidence:
+# Maps R1/R2 as a PAIR to a chimeric reference (genome + cassette contig), then
+# reports three independent lines of evidence:
 #
 #   1. dropout   -- depth across the target locus vs genome-wide median
 #   2. junction  -- read pairs bridging the cassette to unique genome sequence,
@@ -12,18 +12,25 @@
 #                   as a copy-number estimate
 #
 # Usage:
+# Build the chimeric reference first -- it is just a concatenation:
+#   cat MGGv8_genome.fasta cassette.fasta > chimeric.fasta
+#   bwa index chimeric.fasta && samtools faidx chimeric.fasta
+#   grep '>' cassette.fasta        # note the name(s) for --cassette-contig
+#
+# Usage:
 #   ko_verify.sh --sample NAME --r1 R1.fq.gz --r2 R2.fq.gz \
-#                --ref DIR/chimeric.fasta --target contig:start-end \
-#                --outdir DIR [--target contig:start-end ...] \
+#                --ref chimeric.fasta --cassette-contig NAME \
+#                --target contig:start-end --outdir DIR \
+#                [--target contig:start-end ...] \
 #                [--threads 4] [--min-mapq 20] [--flank-window 5000] \
 #                [--min-junction-reads 3] [--arms arms.bed] [--keep-bam]
 #
 # Full run, for a batch of strains:
 #   mkdir -p logs
-#   ./ko_prepare_ref.sh --genome MGGv8_genome.fasta --cassette cassette.fasta \
-#                       --outdir chimeric_ref
+#   cat MGGv8_genome.fasta cassette.fasta > chimeric.fasta
+#   bwa index chimeric.fasta && samtools faidx chimeric.fasta
 #   sbatch --array=1-$(($(wc -l < samples.tsv) - 1)) ko_verify_array.sbatch \
-#          samples.tsv chimeric_ref/chimeric.fasta results
+#          samples.tsv chimeric.fasta results HPH_CASSETTE
 #
 # A strain passes only if the target is deleted, BOTH flanks carry junction
 # support, cassette copy number is ~1x, and no ectopic cluster is found.
@@ -47,7 +54,7 @@ set -e
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
-SAMPLE=""; R1=""; R2=""; REF=""; OUTDIR=""; ARMS=""
+SAMPLE=""; R1=""; R2=""; REF=""; OUTDIR=""; ARMS=""; CAS_ARG=""
 THREADS=4; MINMAPQ=20; FLANK=5000; MINJUNC=3; BIN=500; KEEPBAM=0
 TARGETS=()
 
@@ -59,6 +66,7 @@ while [ $# -gt 0 ]; do
     --ref)                REF="$2";     shift 2 ;;
     --outdir)             OUTDIR="$2";  shift 2 ;;
     --arms)               ARMS="$2";    shift 2 ;;
+    --cassette-contig)    CAS_ARG="$2"; shift 2 ;;
     --target)             TARGETS+=("$2"); shift 2 ;;
     --threads)            THREADS="$2"; shift 2 ;;
     --min-mapq)           MINMAPQ="$2"; shift 2 ;;
@@ -66,7 +74,7 @@ while [ $# -gt 0 ]; do
     --min-junction-reads) MINJUNC="$2"; shift 2 ;;
     --bin)                BIN="$2";     shift 2 ;;
     --keep-bam)           KEEPBAM=1;    shift 1 ;;
-    -h|--help)            sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)            sed -n '2,40p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -80,10 +88,23 @@ done
 [ -s "$R1" ] || die "R1 missing or empty: $R1"
 [ -s "$R2" ] || die "R2 missing or empty: $R2"
 [ "$R1" != "$R2" ] || die "--r1 and --r2 are the same file: $R1"
-[ -s "$REF" ] || die "chimeric reference missing or empty: $REF (run ko_prepare_ref.sh)"
+[ -s "$REF" ] || die "chimeric reference missing or empty: $REF"
 [ -s "${REF}.bwt" ] || die "reference is not bwa-indexed: ${REF}.bwt absent"
 [ -s "${REF}.fai" ] || die "reference is not faidx-indexed: ${REF}.fai absent"
 [ "${#TARGETS[@]}" -ge 1 ] || die "at least one --target contig:start-end is required"
+[ -n "$CAS_ARG" ] || die "--cassette-contig is required (its name in the reference; see: grep '>' cassette.fasta)"
+
+# Cassette contigs are matched by exact name, never by pattern: real cassette
+# headers carry dots and dashes that would be live regex metacharacters.
+CAS_NAMES=()
+IFS=',' read -r -a CAS_SPLIT <<< "$CAS_ARG"
+for c in "${CAS_SPLIT[@]}"; do
+  [ -n "$c" ] || continue
+  awk -v c="$c" '$1 == c { found = 1 } END { exit !found }' "${REF}.fai" \
+    || die "cassette contig '$c' is not in ${REF}.fai -- check: grep '>' your cassette FASTA"
+  CAS_NAMES+=("$c")
+done
+[ "${#CAS_NAMES[@]}" -ge 1 ] || die "--cassette-contig parsed to nothing: $CAS_ARG"
 [ -z "$ARMS" ] || [ -s "$ARMS" ] || die "arms BED missing or empty: $ARMS"
 
 case "$THREADS" in (*[!0-9]*|"") die "--threads must be an integer: $THREADS" ;; esac
@@ -103,6 +124,9 @@ for t in "${TARGETS[@]}"; do
   clen=$(awk -v c="$tc" '$1 == c { print $2; exit }' "${REF}.fai")
   [ -n "$clen" ] || die "contig '$tc' is not in ${REF}.fai (typo? wrong reference?)"
   [ "$te" -le "$clen" ] || die "target end $te exceeds length of $tc ($clen): $t"
+  for c in "${CAS_NAMES[@]}"; do
+    [ "$tc" != "$c" ] || die "--target points at the cassette contig '$c'; it must be the genome locus being replaced"
+  done
 done
 
 BWA_MODULE="${BWA_MODULE:-bwa-0.7.17}"
@@ -124,9 +148,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 BAM="$WORK/${SAMPLE}.sorted.bam"
 
-CAS_CONTIGS=$(awk '$1 ~ /^KO_CASSETTE/ { print $1 }' "${REF}.fai")
-[ -n "$CAS_CONTIGS" ] || die "no KO_CASSETTE* contig in ${REF}.fai; was the reference built by ko_prepare_ref.sh?"
-log "cassette contigs: $(echo "$CAS_CONTIGS" | paste -sd, -)"
+CAS_LIST="$TMP/cassette_contigs.txt"
+printf '%s\n' "${CAS_NAMES[@]}" > "$CAS_LIST"
+CAS_CONTIGS=$(cat "$CAS_LIST")
+log "cassette contigs: $(printf '%s,' "${CAS_NAMES[@]}" | sed 's/,$//')"
 
 # ---------------------------------------------------------------------------
 # 1. Align R1 and R2 together, as a pair.
@@ -181,7 +206,7 @@ depth_stats() {  # reads `samtools depth -a` on stdin -> "mean median n zero_fra
 
 log "computing genome-wide depth (cassette contigs excluded)"
 GENOME_STATS=$(samtools depth -a -Q "$MINMAPQ" "$BAM" \
-  | awk '$1 !~ /^KO_CASSETTE/' | depth_stats)
+  | awk 'NR == FNR { cas[$1]; next } !($1 in cas)' "$CAS_LIST" - | depth_stats)
 GENOME_MEDIAN=$(echo "$GENOME_STATS" | awk '{ print $2 }')
 GENOME_MEAN=$(echo "$GENOME_STATS" | awk '{ print $1 }')
 [ "$GENOME_MEDIAN" -gt 0 ] || die "genome-wide median depth is 0 -- alignment or reference is wrong"
@@ -193,7 +218,7 @@ log "genome median depth = ${GENOME_MEDIAN}x (mean ${GENOME_MEAN}x)"
 if [ -n "$ARMS" ]; then
   log "cassette depth restricted to regions in $ARMS"
   CAS_STATS=$(samtools depth -a -Q "$MINMAPQ" -b "$ARMS" "$BAM" \
-    | awk '$1 ~ /^KO_CASSETTE/' | depth_stats)
+    | awk 'NR == FNR { cas[$1]; next } ($1 in cas)' "$CAS_LIST" - | depth_stats)
 else
   # Query the cassette contigs by region so this is an indexed lookup rather
   # than a second scan of the whole BAM.
@@ -217,11 +242,14 @@ log "extracting cassette-to-genome junction reads (MAPQ >= $MINMAPQ)"
 : > "$TMP/links.tsv"
 
 samtools view -q "$MINMAPQ" -F 0x90C "$BAM" $CAS_CONTIGS \
-  | awk -v OFS='\t' '$7 != "=" && $7 != "*" && $7 !~ /^KO_CASSETTE/ { print $7, $8, "pair" }' \
+  | awk -v OFS='\t' '
+      NR == FNR { cas[$1]; next }
+      $7 != "=" && $7 != "*" && !($7 in cas) { print $7, $8, "pair" }' "$CAS_LIST" - \
   >> "$TMP/links.tsv"
 
 samtools view -q "$MINMAPQ" -F 0x100 "$BAM" $CAS_CONTIGS \
   | awk -v OFS='\t' '
+      NR == FNR { cas[$1]; next }
       {
         for (i = 12; i <= NF; i++) {
           if ($i ~ /^SA:Z:/) {
@@ -229,11 +257,11 @@ samtools view -q "$MINMAPQ" -F 0x100 "$BAM" $CAS_CONTIGS \
             for (j = 1; j <= n; j++) {
               if (recs[j] == "") continue
               split(recs[j], f, ",")
-              if (f[1] !~ /^KO_CASSETTE/) print f[1], f[2], "split"
+              if (!(f[1] in cas)) print f[1], f[2], "split"
             }
           }
         }
-      }' \
+      }' "$CAS_LIST" - \
   >> "$TMP/links.tsv"
 
 NLINKS=$(wc -l < "$TMP/links.tsv" | tr -d ' ')

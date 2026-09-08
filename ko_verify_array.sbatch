@@ -11,10 +11,11 @@
 # Run ko_verify.sh across a samplesheet, one strain per array task.
 #
 #   mkdir -p logs
-#   ko_prepare_ref.sh --genome MGGv8_genome.fasta --cassette cassette.fasta \
-#                     --outdir /path/to/chimeric_ref
+#   cat MGGv8_genome.fasta cassette.fasta > chimeric.fasta
+#   bwa index chimeric.fasta && samtools faidx chimeric.fasta
+#   grep '>' cassette.fasta        # the cassette contig name goes in argument 4
 #   sbatch --array=1-$(($(wc -l < samples.tsv) - 1)) ko_verify_array.sbatch \
-#          samples.tsv /path/to/chimeric_ref/chimeric.fasta results
+#          samples.tsv chimeric.fasta results HPH_CASSETTE
 #
 # samples.tsv is TAB-separated WITH a header line:
 #   sample<TAB>r1<TAB>r2<TAB>targets
@@ -27,9 +28,10 @@ set -e
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-SAMPLESHEET="${1:?usage: sbatch --array=N-M ko_verify_array.sbatch samples.tsv chimeric.fasta outdir}"
-REF="${2:?chimeric.fasta is required (see ko_prepare_ref.sh)}"
+SAMPLESHEET="${1:?usage: sbatch --array=N-M ko_verify_array.sbatch samples.tsv chimeric.fasta outdir cassette_contig}"
+REF="${2:?chimeric.fasta is required}"
 OUTDIR="${3:?output directory is required}"
+CAS_CONTIG="${4:?cassette contig name is required (see: grep '>' cassette.fasta)}"
 
 [ -s "$SAMPLESHEET" ] || die "samplesheet missing or empty: $SAMPLESHEET"
 [ -s "$REF" ]         || die "chimeric reference missing or empty: $REF"
@@ -67,5 +69,6 @@ exec "$VERIFY" \
   --r2      "$R2" \
   --ref     "$REF" \
   --outdir  "$OUTDIR" \
+  --cassette-contig "$CAS_CONTIG" \
   --threads "${SLURM_CPUS_PER_TASK:-4}" \
   "${TARGET_ARGS[@]}"
