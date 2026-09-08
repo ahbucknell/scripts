@@ -85,6 +85,7 @@ REPEAT_FRAC=0.30   # MAPQ-0 depth above this fraction of genome median means the
                 # "dropout" is an unmappable repeat, not a deletion
 CN_HIGH=1.5     # Cassette depth ratio above this suggests an extra copy
 CN_LOW=0.60     # ...and below this a partial or truncated integration
+CN_ABSENT=0.10  # ...and below this there is no cassette in the strain at all
 
 SAMPLE=""; R1=""; R2=""; REF=""; CAS=""; TARGET=""; OUTDIR=""
 THREADS="${SLURM_CPUS_PER_TASK:-4}"; KEEPBAM=0
@@ -262,10 +263,13 @@ sort -k1,1 -k2,2n "$TMP/links.tsv" \
         if (n < minj) return
         cls = "ectopic_candidate"
         if (c == tc && end >= ts - flank && start <= te + flank) cls = "expected_junction"
-        print c, start, end, n, np, ns, cls
+        print c, start, end, n, np + 0, ns + 0, cls
       }
       BEGIN { print "contig", "start", "end", "n_reads", "n_pair", "n_split", "class" }
-      NR == 1 { c = $1; start = $2; end = $2 }
+      # n/np/ns must be initialised here too, not only in the reset branch: an
+      # unset awk variable prints as "" rather than 0, which drops a field and
+      # shifts every column of the first cluster left by one.
+      NR == 1 { c = $1; start = $2; end = $2; n = 0; np = 0; ns = 0 }
       $1 != c || $2 - end > gap { flush(); c = $1; start = $2; n = 0; np = 0; ns = 0 }
       { end = $2; n++; if ($3 == "pair") np++; else ns++ }
       END { if (NR > 0) flush() }' \
@@ -307,6 +311,8 @@ fi
 COPYNUM="single"
 if awk -v r="$CRATIO" -v h="$CN_HIGH" 'BEGIN { exit !(r > h) }'; then
   COPYNUM="multi_copy"
+elif awk -v r="$CRATIO" -v a="$CN_ABSENT" 'BEGIN { exit !(r < a) }'; then
+  COPYNUM="absent"          # no cassette at all: untransformed, or wrong strain
 elif awk -v r="$CRATIO" -v l="$CN_LOW" 'BEGIN { exit !(r < l) }'; then
   COPYNUM="low_or_partial"
 fi
