@@ -172,10 +172,10 @@ else
       "$REF" "$R1" "$R2" \
     | samtools sort -@ "$THREADS" -T "$TMP/sort" -o "$BAM" -
   set +o pipefail
-  samtools index -@ "$THREADS" "$BAM"
+  samtools index "$BAM"
 fi
 samtools quickcheck "$BAM" || die "BAM failed samtools quickcheck: $BAM"
-[ -s "${BAM}.bai" ] || samtools index -@ "$THREADS" "$BAM"
+[ -s "${BAM}.bai" ] || samtools index "$BAM"
 
 samtools flagstat -@ "$THREADS" "$BAM" > "$WORK/${SAMPLE}.flagstat.txt"
 PAIRED=$(awk '/properly paired/ { print $1; exit }' "$WORK/${SAMPLE}.flagstat.txt")
