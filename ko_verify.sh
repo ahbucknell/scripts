@@ -44,8 +44,7 @@
 #   - ectopic clusters force REVIEW, they are not called: with no sequenced WT
 #     control a pre-existing repeat looks the same.
 #   - copy number is a depth ratio, so ~1x means "consistent with single copy",
-#     not proof. It also reads low if the cassette's homology arms are long,
-#     since arm reads multi-map and are filtered.
+#     not proof of it.
 #   - small markerless CRISPR indels are out of scope; that needs variant calling.
 #
 # Supersedes the *_convert_fastq_to_bam.bash scripts, which globbed *.fq.gz and
@@ -57,11 +56,35 @@ set -e
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
-# Tuning constants. Edit here rather than adding flags for them.
-BIN=500        # junction clustering window, bp
-FLANK=5000     # how far from the target a cluster still counts as its junction
-MINJUNC=3      # reads needed before a cluster is believed
-MINMAPQ=20     # below this a read is treated as ambiguously placed
+# --- tuning constants -------------------------------------------------------
+# Every threshold lives here, including the ones the verdict logic applies.
+# Edit these rather than adding flags.
+
+MINMAPQ=20      # MAPQ 20 = 1% chance the read is misplaced. bwa mem gives 0 to
+                # equal-best multi-mappers and scales to 60. Field standard.
+
+GAP=500         # Junction clustering: positions further apart than this start a
+                # new cluster. Mates from one junction scatter over about one
+                # insert (~350 bp for Novogene PE150), so this is ~1.5 inserts.
+
+FLANK=1000      # How far from the target edge a cluster still counts as that
+                # target's junction. Derived, not guessed: a mate cannot land
+                # further out than homology arm (70 bp) + insert (~350 bp), so
+                # 1000 is that with slack. Raising this hides real ectopic
+                # insertions by absorbing them into "expected".
+
+MINJUNC_FLOOR=5 # Junction reads needed before a cluster is believed. Scaled
+MINJUNC_FRAC=0.15  # against measured depth: at 100x expect 20-35 pairs per
+                # flank, so a fixed floor of 3 would accept noise. On a poor
+                # library the floor takes over. Computed once GMED is known.
+
+DROP_RATIO=0.10 # Target counts as deleted below this fraction of genome median
+DROP_ZERO=0.90  # ...and with at least this fraction of its bases at zero depth
+PART_ZERO=0.30  # Above this but short of DROP_ZERO is a partial deletion
+REPEAT_FRAC=0.30   # MAPQ-0 depth above this fraction of genome median means the
+                # "dropout" is an unmappable repeat, not a deletion
+CN_HIGH=1.5     # Cassette depth ratio above this suggests an extra copy
+CN_LOW=0.60     # ...and below this a partial or truncated integration
 
 SAMPLE=""; R1=""; R2=""; REF=""; CAS=""; TARGET=""; OUTDIR=""
 THREADS="${SLURM_CPUS_PER_TASK:-4}"; KEEPBAM=0
@@ -192,14 +215,23 @@ TMEAN_Q0=$(samtools depth -a -Q 0 -r "$TARGET" "$BAM" | depth_stats | awk '{ pri
 TRATIO=$(awk -v a="$TMEAN" -v g="$GMED" 'BEGIN { printf "%.3f", a / g }')
 log "genome median ${GMED}x  target mean ${TMEAN}x  cassette ratio ${CRATIO}"
 
+# Junction threshold scales with the depth actually observed, so the script does
+# not assume a coverage level.
+MINJUNC=$(awk -v g="$GMED" -v f="$MINJUNC_FRAC" -v fl="$MINJUNC_FLOOR" \
+  'BEGIN { m = int(g * f); print (m > fl ? m : fl) }')
+log "junction threshold: $MINJUNC reads (floor $MINJUNC_FLOOR, ${MINJUNC_FRAC} x depth)"
+
 # --- 3. cassette-to-genome junctions ----------------------------------------
 # Two signals pooled: discordant pairs (read on the cassette, mate on the
 # genome) and split reads (an SA:Z alignment crossing over). 0x90C drops
 # secondary, supplementary, unmapped and mate-unmapped records.
 #
-# Note this deliberately does not use reads sitting on the cassette's homology
-# arms: those are identical to the genome flanks, so they multi-map at MAPQ 0.
-# The informative read is the one whose mate is in unique genome sequence.
+# The 70 bp homology arms are shorter than one read, so a read overlapping an
+# arm almost always extends into unique genome or into the marker and is
+# uniquely placeable. Long arms would break this: with arms longer than the
+# insert size no pair can reach from the marker into unique genome, correct
+# targeting creates no novel genome junction at all, and this whole check
+# becomes unsatisfiable. Re-derive FLANK below if the construct changes.
 log "extracting junction reads"
 {
   samtools view -q "$MINMAPQ" -F 0x90C "$BAM" "$CAS" \
@@ -219,24 +251,24 @@ log "extracting junction reads"
         }'
 } > "$TMP/links.tsv"
 
+# Single-linkage clustering on a gap, not fixed bins: a fixed grid splits any
+# junction that lands on a boundary across two clusters, halving both counts and
+# potentially dropping both below threshold. A gap has no boundary to land on.
 JUNC="$WORK/${SAMPLE}.junctions.tsv"
-awk -v OFS='\t' -v bin="$BIN" -v minj="$MINJUNC" -v flank="$FLANK" \
-    -v tc="$TC" -v ts="$TS" -v te="$TE" '
-  {
-    b = int($2 / bin) * bin; k = $1 SUBSEP b
-    total[k]++; contig[k] = $1; pos[k] = b
-    if ($3 == "pair") npair[k]++; else nsplit[k]++
-  }
-  END {
-    print "contig", "bin_start", "bin_end", "n_reads", "n_pair", "n_split", "class"
-    for (k in total) {
-      if (total[k] < minj) continue
-      cls = "ectopic_candidate"
-      if (contig[k] == tc && pos[k] + bin >= ts - flank && pos[k] <= te + flank)
-        cls = "expected_junction"
-      print contig[k], pos[k], pos[k] + bin, total[k], npair[k] + 0, nsplit[k] + 0, cls
-    }
-  }' "$TMP/links.tsv" \
+sort -k1,1 -k2,2n "$TMP/links.tsv" \
+  | awk -v OFS='\t' -v gap="$GAP" -v minj="$MINJUNC" -v flank="$FLANK" \
+        -v tc="$TC" -v ts="$TS" -v te="$TE" '
+      function flush(   cls) {
+        if (n < minj) return
+        cls = "ectopic_candidate"
+        if (c == tc && end >= ts - flank && start <= te + flank) cls = "expected_junction"
+        print c, start, end, n, np, ns, cls
+      }
+      BEGIN { print "contig", "start", "end", "n_reads", "n_pair", "n_split", "class" }
+      NR == 1 { c = $1; start = $2; end = $2 }
+      $1 != c || $2 - end > gap { flush(); c = $1; start = $2; n = 0; np = 0; ns = 0 }
+      { end = $2; n++; if ($3 == "pair") np++; else ns++ }
+      END { if (NR > 0) flush() }' \
   | { read -r h; echo "$h"; sort -k4,4nr; } > "$JUNC"
 
 # A cluster counts for the LEFT flank only if it ends at or before the target
@@ -250,11 +282,19 @@ log "junction reads: left=$JL right=$JR  ectopic clusters=$NECT"
 
 # --- 4. verdict -------------------------------------------------------------
 DROPOUT="no"
-if awk -v r="$TRATIO" -v z="$TZERO" 'BEGIN { exit !(r < 0.10 && z > 0.90) }'; then
+if awk -v r="$TRATIO" -v z="$TZERO" -v dr="$DROP_RATIO" -v dz="$DROP_ZERO" \
+     'BEGIN { exit !(r < dr && z > dz) }'; then
   DROPOUT="yes"
-  if awk -v q="$TMEAN_Q0" -v g="$GMED" 'BEGIN { exit !(q > 0.30 * g) }'; then
+  # Healthy depth at MAPQ 0 where there is none above it means the locus is
+  # unmappable, not deleted. Never report that as a knockout.
+  if awk -v q="$TMEAN_Q0" -v g="$GMED" -v f="$REPEAT_FRAC" \
+       'BEGIN { exit !(q > f * g) }'; then
     DROPOUT="ambiguous_repeat"
   fi
+elif awk -v z="$TZERO" -v pz="$PART_ZERO" 'BEGIN { exit !(z > pz) }'; then
+  # Part of the ORF is gone but not all of it. Distinguishing this from "no
+  # deletion at all" matters -- both used to report the same FAIL.
+  DROPOUT="partial"
 fi
 
 INTEGRATION="no"
@@ -265,14 +305,18 @@ elif [ "$JL" -ge "$MINJUNC" ] || [ "$JR" -ge "$MINJUNC" ]; then
 fi
 
 COPYNUM="single"
-if awk -v r="$CRATIO" 'BEGIN { exit !(r > 1.5) }'; then
+if awk -v r="$CRATIO" -v h="$CN_HIGH" 'BEGIN { exit !(r > h) }'; then
   COPYNUM="multi_copy"
-elif awk -v r="$CRATIO" 'BEGIN { exit !(r < 0.60) }'; then
+elif awk -v r="$CRATIO" -v l="$CN_LOW" 'BEGIN { exit !(r < l) }'; then
   COPYNUM="low_or_partial"
 fi
 
 VERDICT="PASS"
-[ "$DROPOUT" = "yes" ] || VERDICT="FAIL"
+case "$DROPOUT" in
+  yes)     ;;
+  partial) VERDICT="REVIEW" ;;
+  *)       VERDICT="FAIL" ;;
+esac
 [ "$INTEGRATION" = "both_flanks" ] || VERDICT="FAIL"
 if [ "$VERDICT" = "PASS" ]; then
   [ "$COPYNUM" = "single" ] || VERDICT="REVIEW"
