@@ -17,6 +17,30 @@
 #                --outdir DIR [--target contig:start-end ...] \
 #                [--threads 4] [--min-mapq 20] [--flank-window 5000] \
 #                [--min-junction-reads 3] [--arms arms.bed] [--keep-bam]
+#
+# Full run, for a batch of strains:
+#   mkdir -p logs
+#   ./ko_prepare_ref.sh --genome MGGv8_genome.fasta --cassette cassette.fasta \
+#                       --outdir chimeric_ref
+#   sbatch --array=1-$(($(wc -l < samples.tsv) - 1)) ko_verify_array.sbatch \
+#          samples.tsv chimeric_ref/chimeric.fasta results
+#
+# A strain passes only if the target is deleted, BOTH flanks carry junction
+# support, cassette copy number is ~1x, and no ectopic cluster is found.
+#
+# Limits, so the report is not over-read:
+#   - No sequenced WT control, so a pre-existing repeat or segmental duplication
+#     can look ectopic. Such clusters force REVIEW; they are not called.
+#   - Copy number is a depth ratio and is sensitive to GC and coverage bias.
+#     ~1x means "consistent with single copy", not proof of it.
+#   - Small markerless CRISPR indels are out of scope; that needs variant
+#     calling, not coverage.
+#   - Bins are a fixed 500 bp, so a junction on a bin boundary splits across two
+#     clusters. Both still classify correctly, but per-cluster counts halve.
+#
+# Supersedes the *_convert_fastq_to_bam.bash scripts in the Novogene run
+# directories, which globbed *.fq.gz and passed ONE file per bwa mem call,
+# producing a separate single-end BAM for R1 and for R2.
 
 set -e
 

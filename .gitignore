@@ -23,6 +23,3 @@ JuliaLocalPreferences.toml
 
 # MacOS folder view configuration files
 .DS_Store
-
-# Current task state; history does not matter
-TODO.md
